@@ -19,6 +19,7 @@
 
 package org.apache.iceberg.spark.extensions;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -41,12 +42,13 @@ import org.junit.Test;
 import org.junit.runners.Parameterized;
 
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT;
-import static org.apache.iceberg.TableProperties.MERGE_WRITE_CARDINALITY_CHECK;
+import static org.apache.iceberg.TableProperties.MERGE_CARDINALITY_CHECK_ENABLED;
 import static org.apache.iceberg.TableProperties.PARQUET_VECTORIZATION_ENABLED;
 
 public class TestMergeIntoTable extends SparkRowLevelOperationsTestBase {
   private final String sourceName;
   private final String targetName;
+  private final List<String> writeModes = new ArrayList<>(Arrays.asList("none", "hash", "range"));
 
   @Parameterized.Parameters(
       name = "catalogName = {0}, implementation = {1}, config = {2}, format = {3}, vectorized = {4}")
@@ -251,9 +253,7 @@ public class TestMergeIntoTable extends SparkRowLevelOperationsTestBase {
             "WHEN MATCHED AND target.id = 6 THEN DELETE " +
             "WHEN NOT MATCHED AND source.id = 2 THEN INSERT * ";
 
-    String tabName = catalogName + "." + "default.target";
-    String errorMsg = "The same row of target table `" + tabName + "` was identified more than\n" +
-            " once for an update, delete or insert operation of the MERGE statement.";
+    String errorMsg = "statement matched a single row from the target table with multiple rows of the source table";
     AssertHelpers.assertThrows("Should complain ambiguous row in target",
            SparkException.class, errorMsg, () -> sql(sqlText, targetName, sourceName));
     assertEquals("Target should be unchanged",
@@ -268,7 +268,7 @@ public class TestMergeIntoTable extends SparkRowLevelOperationsTestBase {
            new Employee(2, "emp-id-2"), new Employee(6, "emp-id-6"));
 
     // Disable count check
-    sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%b')", targetName, MERGE_WRITE_CARDINALITY_CHECK, false);
+    sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%b')", targetName, MERGE_CARDINALITY_CHECK_ENABLED, false);
 
     String sqlText = "MERGE INTO %s AS target " +
             "USING %s AS source " +
@@ -314,14 +314,117 @@ public class TestMergeIntoTable extends SparkRowLevelOperationsTestBase {
            "WHEN MATCHED AND target.id = 1 THEN DELETE " +
            "WHEN NOT MATCHED AND source.id = 2 THEN INSERT * ";
 
-    String tabName = catalogName + "." + "default.target";
-    String errorMsg = "The same row of target table `" + tabName + "` was identified more than\n" +
-            " once for an update, delete or insert operation of the MERGE statement.";
+    String errorMsg = "statement matched a single row from the target table with multiple rows of the source table";
     AssertHelpers.assertThrows("Should complain ambiguous row in target",
            SparkException.class, errorMsg, () -> sql(sqlText, targetName, sourceName));
     assertEquals("Target should be unchanged",
            ImmutableList.of(row(1, "emp-id-one"), row(6, "emp-id-6")),
            sql("SELECT * FROM %s ORDER BY id ASC NULLS LAST", targetName));
+  }
+
+  @Test
+  public void testIdentityPartition()  {
+    writeModes.forEach(mode -> {
+      removeTables();
+      sql("CREATE TABLE %s (id INT, dep STRING) USING iceberg PARTITIONED BY (identity(dep))", targetName);
+      initTable(targetName);
+      setDistributionMode(targetName, mode);
+      createAndInitSourceTable(sourceName);
+      append(targetName, new Employee(1, "emp-id-one"), new Employee(6, "emp-id-6"));
+      append(sourceName, new Employee(2, "emp-id-2"), new Employee(1, "emp-id-1"), new Employee(6, "emp-id-6"));
+
+      String sqlText = "MERGE INTO %s AS target " +
+              "USING %s AS source " +
+              "ON target.id = source.id " +
+              "WHEN MATCHED AND target.id = 1 THEN UPDATE SET * " +
+              "WHEN MATCHED AND target.id = 6 THEN DELETE " +
+              "WHEN NOT MATCHED AND source.id = 2 THEN INSERT * ";
+
+      sql(sqlText, targetName, sourceName);
+      assertEquals("Should have expected rows",
+             ImmutableList.of(row(1, "emp-id-1"), row(2, "emp-id-2")),
+             sql("SELECT * FROM %s ORDER BY id ASC NULLS LAST", targetName));
+    });
+  }
+
+  @Test
+  public void testDaysTransform() {
+    writeModes.forEach(mode -> {
+      removeTables();
+      sql("CREATE TABLE %s (id INT, ts timestamp) USING iceberg PARTITIONED BY (days(ts))", targetName);
+      initTable(targetName);
+      setDistributionMode(targetName, mode);
+      sql("CREATE TABLE %s (id INT, ts timestamp) USING iceberg", sourceName);
+      initTable(sourceName);
+      sql("INSERT INTO " + targetName + " VALUES (1, timestamp('2001-01-01 00:00:00'))," +
+              "(6, timestamp('2001-01-06 00:00:00'))");
+      sql("INSERT INto " + sourceName + " VALUES (2, timestamp('2001-01-02 00:00:00'))," +
+              "(1, timestamp('2001-01-01 00:00:00'))," +
+              "(6, timestamp('2001-01-06 00:00:00'))");
+
+      String sqlText = "MERGE INTO %s AS target \n" +
+              "USING %s AS source \n" +
+              "ON target.id = source.id \n" +
+              "WHEN MATCHED AND target.id = 1 THEN UPDATE SET * \n" +
+              "WHEN MATCHED AND target.id = 6 THEN DELETE \n" +
+              "WHEN NOT MATCHED AND source.id = 2 THEN INSERT * ";
+
+      sql(sqlText, targetName, sourceName);
+      assertEquals("Should have expected rows",
+             ImmutableList.of(row(1, "2001-01-01 00:00:00"), row(2, "2001-01-02 00:00:00")),
+             sql("SELECT id, CAST(ts AS STRING) FROM %s ORDER BY id ASC NULLS LAST", targetName));
+    });
+  }
+
+  @Test
+  public void testBucketExpression() {
+    writeModes.forEach(mode -> {
+      removeTables();
+      sql("CREATE TABLE %s (id INT, dep STRING) USING iceberg" +
+              " CLUSTERED BY (dep) INTO 2 BUCKETS", targetName);
+      initTable(targetName);
+      setDistributionMode(targetName, mode);
+      createAndInitSourceTable(sourceName);
+      append(targetName, new Employee(1, "emp-id-one"), new Employee(6, "emp-id-6"));
+      append(sourceName, new Employee(2, "emp-id-2"), new Employee(1, "emp-id-1"), new Employee(6, "emp-id-6"));
+      String sqlText = "MERGE INTO %s AS target \n" +
+              "USING %s AS source \n" +
+              "ON target.id = source.id \n" +
+              "WHEN MATCHED AND target.id = 1 THEN UPDATE SET * \n" +
+              "WHEN MATCHED AND target.id = 6 THEN DELETE \n" +
+              "WHEN NOT MATCHED AND source.id = 2 THEN INSERT * ";
+
+      sql(sqlText, targetName, sourceName);
+      assertEquals("Should have expected rows",
+             ImmutableList.of(row(1, "emp-id-1"), row(2, "emp-id-2")),
+             sql("SELECT * FROM %s ORDER BY id ASC NULLS LAST", targetName));
+    });
+  }
+
+  @Test
+  public void testPartitionedAndOrderedTable() {
+    writeModes.forEach(mode -> {
+      removeTables();
+      sql("CREATE TABLE %s (id INT, dep STRING) USING iceberg" +
+              " PARTITIONED BY (id)", targetName);
+      sql("ALTER TABLE %s  WRITE ORDERED BY (dep)", targetName);
+      initTable(targetName);
+      setDistributionMode(targetName, mode);
+      createAndInitSourceTable(sourceName);
+      append(targetName, new Employee(1, "emp-id-one"), new Employee(6, "emp-id-6"));
+      append(sourceName, new Employee(2, "emp-id-2"), new Employee(1, "emp-id-1"), new Employee(6, "emp-id-6"));
+      String sqlText = "MERGE INTO %s AS target \n" +
+              "USING %s AS source \n" +
+              "ON target.id = source.id \n" +
+              "WHEN MATCHED AND target.id = 1 THEN UPDATE SET * \n" +
+              "WHEN MATCHED AND target.id = 6 THEN DELETE \n" +
+              "WHEN NOT MATCHED AND source.id = 2 THEN INSERT * ";
+
+      sql(sqlText, targetName, sourceName);
+      assertEquals("Should have expected rows",
+             ImmutableList.of(row(1, "emp-id-1"), row(2, "emp-id-2")),
+             sql("SELECT * FROM %s ORDER BY id ASC NULLS LAST", targetName));
+    });
   }
 
   protected void createAndInitUnPartitionedTargetTable(String tabName) {
@@ -355,9 +458,17 @@ public class TestMergeIntoTable extends SparkRowLevelOperationsTestBase {
     });
   }
 
-  protected void append(String tabName, Employee... employees) throws NoSuchTableException {
-    List<Employee> input = Arrays.asList(employees);
-    Dataset<Row> inputDF = spark.createDataFrame(input, Employee.class);
-    inputDF.coalesce(1).writeTo(tabName).append();
+  private void setDistributionMode(String tabName, String mode) {
+    sql("ALTER TABLE %s SET TBLPROPERTIES('%s' '%s')", tabName, TableProperties.WRITE_DISTRIBUTION_MODE, mode);
+  }
+
+  protected void append(String tabName, Employee... employees) {
+    try {
+      List<Employee> input = Arrays.asList(employees);
+      Dataset<Row> inputDF = spark.createDataFrame(input, Employee.class);
+      inputDF.coalesce(1).writeTo(tabName).append();
+    } catch (NoSuchTableException e) {
+      throw new RuntimeException(e.getMessage());
+    }
   }
 }

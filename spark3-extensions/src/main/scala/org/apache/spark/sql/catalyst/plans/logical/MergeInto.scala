@@ -21,14 +21,11 @@ package org.apache.spark.sql.catalyst.plans.logical
 
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 
 case class MergeInto(
     mergeIntoProcessor: MergeIntoParams,
-    targetRelation: DataSourceV2Relation,
-    child: LogicalPlan) extends UnaryNode {
-  override def output: Seq[Attribute] = targetRelation.output
-}
+    output: Seq[Attribute],
+    child: LogicalPlan) extends UnaryNode
 
 case class MergeIntoParams(
     isSourceRowNotPresent: Expression,

@@ -22,6 +22,7 @@ import java.util.UUID
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst
 import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.expressions.AccumulateFiles
 import org.apache.spark.sql.catalyst.expressions.Alias
@@ -29,20 +30,43 @@ import org.apache.spark.sql.catalyst.expressions.And
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.AttributeSet
-import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GreaterThan
+import org.apache.spark.sql.catalyst.expressions.IcebergBucketTransform
+import org.apache.spark.sql.catalyst.expressions.IcebergDayTransform
+import org.apache.spark.sql.catalyst.expressions.IcebergHourTransform
+import org.apache.spark.sql.catalyst.expressions.IcebergMonthTransform
+import org.apache.spark.sql.catalyst.expressions.IcebergYearTransform
 import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.expressions.NamedExpression
 import org.apache.spark.sql.catalyst.expressions.PredicateHelper
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.expressions.aggregate.Complete
 import org.apache.spark.sql.catalyst.expressions.aggregate.Sum
 import org.apache.spark.sql.catalyst.plans.logical.Aggregate
 import org.apache.spark.sql.catalyst.plans.logical.DynamicFileFilter
-import org.apache.spark.sql.catalyst.plans.logical.DynamicFileFilterWithCountCheck
+import org.apache.spark.sql.catalyst.plans.logical.DynamicFileFilterWithCardinalityCheck
 import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.logical.Project
+import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.quoteIfNeeded
 import org.apache.spark.sql.connector.catalog.Table
+import org.apache.spark.sql.connector.expressions.BucketTransform
+import org.apache.spark.sql.connector.expressions.DaysTransform
+import org.apache.spark.sql.connector.expressions.Expression
+import org.apache.spark.sql.connector.expressions.FieldReference
+import org.apache.spark.sql.connector.expressions.HoursTransform
+import org.apache.spark.sql.connector.expressions.IdentityTransform
+import org.apache.spark.sql.connector.expressions.MonthsTransform
+import org.apache.spark.sql.connector.expressions.NamedReference
+import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.connector.expressions.YearsTransform
+import org.apache.spark.sql.connector.iceberg.distributions.ClusteredDistribution
+import org.apache.spark.sql.connector.iceberg.distributions.Distribution
+import org.apache.spark.sql.connector.iceberg.distributions.OrderedDistribution
+import org.apache.spark.sql.connector.iceberg.distributions.UnspecifiedDistribution
+import org.apache.spark.sql.connector.iceberg.expressions.NullOrdering
+import org.apache.spark.sql.connector.iceberg.expressions.SortDirection
+import org.apache.spark.sql.connector.iceberg.expressions.SortOrder
 import org.apache.spark.sql.connector.iceberg.read.SupportsFileFilter
 import org.apache.spark.sql.connector.iceberg.write.MergeBuilder
 import org.apache.spark.sql.connector.read.ScanBuilder
@@ -63,7 +87,8 @@ trait RewriteRowLevelOperationHelper extends PredicateHelper with Logging {
 
   protected val FILE_NAME_COL = "_file"
   protected val ROW_POS_COL = "_pos"
-  protected val AFFECTED_FILES_ACC_NAME = "affectedFiles"
+  // `internal.metrics` prefix ensures the accumulator state is not tracked by Spark UI
+  protected val AFFECTED_FILES_ACC_NAME = "internal.metrics.merge.affectedFiles"
   protected val AFFECTED_FILES_ACC_ALIAS_NAME = "_affectedFiles_"
   protected val SUM_ROW_ID_ALIAS_NAME = "_sum_"
 
@@ -71,7 +96,7 @@ trait RewriteRowLevelOperationHelper extends PredicateHelper with Logging {
 
   protected def buildSimpleScanPlan(
       relation: DataSourceV2Relation,
-      cond: Expression): LogicalPlan = {
+      cond: catalyst.expressions.Expression): LogicalPlan = {
 
     val scanBuilder = relation.table.asReadable.newScanBuilder(relation.options)
 
@@ -90,9 +115,9 @@ trait RewriteRowLevelOperationHelper extends PredicateHelper with Logging {
       table: Table,
       tableAttrs: Seq[AttributeReference],
       mergeBuilder: MergeBuilder,
-      cond: Expression,
+      cond: catalyst.expressions.Expression,
       matchingRowsPlanBuilder: DataSourceV2ScanRelation => LogicalPlan,
-      performCountCheckForMerge: Boolean = false): LogicalPlan = {
+      runCardinalityCheck: Boolean = false): LogicalPlan = {
 
     val scanBuilder = mergeBuilder.asScanBuilder
 
@@ -103,31 +128,39 @@ trait RewriteRowLevelOperationHelper extends PredicateHelper with Logging {
     val scanRelation = DataSourceV2ScanRelation(table, scan, outputAttrs)
 
     scan match {
+      case filterable: SupportsFileFilter if runCardinalityCheck =>
+        val affectedFilesAcc = new SetAccumulator[String]()
+        spark.sparkContext.register(affectedFilesAcc, AFFECTED_FILES_ACC_NAME)
+
+        val matchingRowsPlan = matchingRowsPlanBuilder(scanRelation)
+        val matchingFilesPlan = buildFileFilterPlan(affectedFilesAcc, matchingRowsPlan)
+
+        DynamicFileFilterWithCardinalityCheck(
+          scanRelation,
+          matchingFilesPlan,
+          filterable,
+          affectedFilesAcc)
+
       case filterable: SupportsFileFilter =>
-        if (performCountCheckForMerge) {
-          val affectedFilesAcc = new SetAccumulator[String]()
-          spark.sparkContext.register(affectedFilesAcc, AFFECTED_FILES_ACC_NAME)
-          val planWithAccumulator = buildPlanWithFileAccumulator(affectedFilesAcc,
-            matchingRowsPlanBuilder(scanRelation))
-          DynamicFileFilterWithCountCheck(scanRelation, planWithAccumulator, filterable,
-            affectedFilesAcc, table.name())
-        } else {
-          val matchingFilePlan = buildFileFilterPlan(scanRelation.output, matchingRowsPlanBuilder(scanRelation))
-          DynamicFileFilter(scanRelation, matchingFilePlan, filterable)
-        }
+        val matchingRowsPlan = matchingRowsPlanBuilder(scanRelation)
+        val matchingFilesPlan = buildFileFilterPlan(scanRelation.output, matchingRowsPlan)
+        DynamicFileFilter(scanRelation, matchingFilesPlan, filterable)
+
       case _ =>
         scanRelation
     }
   }
 
-  private def extractFilters(cond: Expression, tableAttrs: Seq[AttributeReference]): Seq[Expression] = {
+  private def extractFilters(
+      cond: catalyst.expressions.Expression,
+      tableAttrs: Seq[AttributeReference]): Seq[catalyst.expressions.Expression] = {
     val tableAttrSet = AttributeSet(tableAttrs)
     splitConjunctivePredicates(cond).filter(_.references.subsetOf(tableAttrSet))
   }
 
   private def pushFilters(
       scanBuilder: ScanBuilder,
-      cond: Expression,
+      cond: catalyst.expressions.Expression,
       tableAttrs: Seq[AttributeReference]): Unit = {
     val predicates = extractFilters(cond, tableAttrs)
     if (predicates.nonEmpty) {
@@ -136,7 +169,7 @@ trait RewriteRowLevelOperationHelper extends PredicateHelper with Logging {
     }
   }
 
-  protected def toDataSourceFilters(predicates: Seq[Expression]): Array[sources.Filter] = {
+  protected def toDataSourceFilters(predicates: Seq[catalyst.expressions.Expression]): Array[sources.Filter] = {
     predicates.flatMap { p =>
       val translatedFilter = DataSourceStrategy.translateFilter(p, supportNestedPredicatePushdown = true)
       if (translatedFilter.isEmpty) {
@@ -157,9 +190,9 @@ trait RewriteRowLevelOperationHelper extends PredicateHelper with Logging {
     Project(Seq(findOutputAttr(agg.output, FILE_NAME_COL)), agg)
   }
 
-  private def buildPlanWithFileAccumulator(
-         filesAccumulator: SetAccumulator[String],
-         prunedTargetPlan: LogicalPlan): LogicalPlan = {
+  private def buildFileFilterPlan(
+      filesAccumulator: SetAccumulator[String],
+      prunedTargetPlan: LogicalPlan): LogicalPlan = {
     val fileAttr = findOutputAttr(prunedTargetPlan.output, FILE_NAME_COL)
     val rowPosAttr = findOutputAttr(prunedTargetPlan.output, ROW_POS_COL)
     val accumulatorExpr = Alias(AccumulateFiles(filesAccumulator, fileAttr), AFFECTED_FILES_ACC_ALIAS_NAME)()
@@ -192,6 +225,85 @@ trait RewriteRowLevelOperationHelper extends PredicateHelper with Logging {
           // if the field is new, create a new attribute
           AttributeReference(a.name, a.dataType, a.nullable, a.metadata)()
       }
+    }
+  }
+
+  private object BucketTransform {
+    def unapply(transform: Transform): Option[(Int, FieldReference)] = transform match {
+      case bt: BucketTransform => bt.columns match {
+        case Seq(nf: NamedReference) =>
+          Some(bt.numBuckets.value(), FieldReference(nf.fieldNames()))
+        case _ =>
+          None
+      }
+      case _ => None
+    }
+  }
+
+  protected def toCatalyst(
+      distribution: Distribution,
+      plan: LogicalPlan): Seq[catalyst.expressions.Expression] = {
+
+    distribution match {
+      case d: OrderedDistribution =>
+        d.ordering.map(e => toCatalyst(e, plan, resolver))
+      case d: ClusteredDistribution =>
+        d.clustering.map(e => toCatalyst(e, plan, resolver))
+      case _: UnspecifiedDistribution =>
+        Array.empty[catalyst.expressions.Expression]
+    }
+  }
+
+  private def toCatalyst(
+      expr: Expression,
+      query: LogicalPlan,
+      resolver: Resolver): catalyst.expressions.Expression = {
+
+    def resolve(parts: Seq[String]): NamedExpression = {
+      // this part is controversial as we perform resolution in the optimizer
+      // we cannot perform this step in the analyzer since we need to optimize expressions
+      // in nodes like OverwriteByExpression before constructing a logical write
+      query.resolve(parts, resolver) match {
+        case Some(attr) => attr
+        case None => throw new AnalysisException(s"Cannot resolve '${parts.map(quoteIfNeeded).mkString(".")}'" +
+          s" using ${query.output}")
+      }
+    }
+
+    expr match {
+      case s: SortOrder =>
+        val catalystChild = toCatalyst(s.expression(), query, resolver)
+        catalyst.expressions.SortOrder(catalystChild, toCatalyst(s.direction), toCatalyst(s.nullOrdering), Set.empty)
+      case it: IdentityTransform =>
+        resolve(it.ref.fieldNames())
+      case BucketTransform(numBuckets, ref) =>
+        IcebergBucketTransform(numBuckets, resolve(ref.fieldNames))
+      case yt: YearsTransform =>
+        IcebergYearTransform(resolve(yt.ref.fieldNames))
+      case mt: MonthsTransform =>
+        IcebergMonthTransform(resolve(mt.ref.fieldNames))
+      case dt: DaysTransform =>
+        IcebergDayTransform(resolve(dt.ref.fieldNames))
+      case ht: HoursTransform =>
+        IcebergHourTransform(resolve(ht.ref.fieldNames))
+      case ref: FieldReference =>
+        resolve(ref.fieldNames)
+      case _ =>
+        throw new RuntimeException(s"$expr is not currently supported")
+    }
+  }
+
+  private def toCatalyst(direction: SortDirection): catalyst.expressions.SortDirection = {
+    direction match {
+      case SortDirection.ASCENDING => catalyst.expressions.Ascending
+      case SortDirection.DESCENDING => catalyst.expressions.Descending
+    }
+  }
+
+  private def toCatalyst(nullOrdering: NullOrdering): catalyst.expressions.NullOrdering = {
+    nullOrdering match {
+      case NullOrdering.NULLS_FIRST => catalyst.expressions.NullsFirst
+      case NullOrdering.NULLS_LAST => catalyst.expressions.NullsLast
     }
   }
 }
