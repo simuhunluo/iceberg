@@ -17,18 +17,21 @@
  * under the License.
  */
 
-package org.apache.spark.sql.catalyst.plans.logical
+package org.apache.iceberg.avro;
 
-import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.util.truncatedString
-import org.apache.spark.sql.connector.iceberg.catalog.Procedure
-import scala.collection.Seq
+import org.apache.avro.io.DatumWriter;
+import org.apache.iceberg.Metrics;
+import org.apache.iceberg.MetricsConfig;
+import org.apache.iceberg.Schema;
 
-case class Call(procedure: Procedure, args: Seq[Expression]) extends Command {
-  override lazy val output: Seq[Attribute] = procedure.outputType.toAttributes
+public class AvroMetrics {
 
-  override def simpleString(maxFields: Int): String = {
-    s"Call${truncatedString(output, "[", ", ", "]", maxFields)} ${procedure.description}"
+  private AvroMetrics() {
+  }
+
+  static Metrics fromWriter(DatumWriter<?> datumWriter, Schema schema, long numRecords,
+                            MetricsConfig inputMetricsConfig) {
+    // TODO will populate in following PRs if datum writer is a MetricsAwareDatumWriter
+    return new Metrics(numRecords, null, null, null);
   }
 }

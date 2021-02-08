@@ -21,13 +21,11 @@ package org.apache.spark.sql.catalyst.optimizer
 
 import org.apache.iceberg.TableProperties.MERGE_CARDINALITY_CHECK_ENABLED
 import org.apache.iceberg.TableProperties.MERGE_CARDINALITY_CHECK_ENABLED_DEFAULT
-import org.apache.iceberg.spark.Spark3Util
 import org.apache.iceberg.util.PropertyUtil
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.expressions.IsNull
+import org.apache.spark.sql.catalyst.expressions.IsNotNull
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.plans.FullOuter
 import org.apache.spark.sql.catalyst.plans.Inner
@@ -35,6 +33,7 @@ import org.apache.spark.sql.catalyst.plans.LeftAnti
 import org.apache.spark.sql.catalyst.plans.RightOuter
 import org.apache.spark.sql.catalyst.plans.logical.AppendData
 import org.apache.spark.sql.catalyst.plans.logical.DeleteAction
+import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.plans.logical.InsertAction
 import org.apache.spark.sql.catalyst.plans.logical.Join
 import org.apache.spark.sql.catalyst.plans.logical.JoinHint
@@ -44,15 +43,12 @@ import org.apache.spark.sql.catalyst.plans.logical.MergeInto
 import org.apache.spark.sql.catalyst.plans.logical.MergeIntoParams
 import org.apache.spark.sql.catalyst.plans.logical.MergeIntoTable
 import org.apache.spark.sql.catalyst.plans.logical.Project
-import org.apache.spark.sql.catalyst.plans.logical.Repartition
 import org.apache.spark.sql.catalyst.plans.logical.ReplaceData
 import org.apache.spark.sql.catalyst.plans.logical.UpdateAction
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.catalyst.utils.DistributionAndOrderingUtils
 import org.apache.spark.sql.catalyst.utils.PlanUtils.isIcebergRelation
 import org.apache.spark.sql.catalyst.utils.RewriteRowLevelOperationHelper
 import org.apache.spark.sql.connector.catalog.Table
-import org.apache.spark.sql.connector.iceberg.distributions.OrderedDistribution
 import org.apache.spark.sql.connector.iceberg.write.MergeBuilder
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Implicits
@@ -63,11 +59,33 @@ case class RewriteMergeInto(spark: SparkSession) extends Rule[LogicalPlan] with 
   import ExtendedDataSourceV2Implicits._
   import RewriteMergeInto._
 
-  private val conf: SQLConf = spark.sessionState.conf
-  override val resolver: Resolver = conf.resolver
-
   override def apply(plan: LogicalPlan): LogicalPlan = {
     plan resolveOperators {
+      case MergeIntoTable(target: DataSourceV2Relation, source, cond, matchedActions, notMatchedActions)
+          if matchedActions.isEmpty && notMatchedActions.size == 1 && isIcebergRelation(target) =>
+
+        val targetTableScan = buildSimpleScanPlan(target, cond)
+
+        // NOT MATCHED conditions may only refer to columns in source so we can push them down
+        val insertAction = notMatchedActions.head.asInstanceOf[InsertAction]
+        val filteredSource = insertAction.condition match {
+          case Some(insertCond) => Filter(insertCond, source)
+          case None => source
+        }
+
+        // when there are no matched actions, use a left anti join to remove any matching rows and rewrite to use
+        // append instead of replace. only unmatched source rows are passed to the merge and actions are all inserts.
+        val joinPlan = Join(filteredSource, targetTableScan, LeftAnti, Some(cond), JoinHint.NONE)
+
+        val outputExprs = insertAction.assignments.map(_.value)
+        val outputColNames = target.output.map(_.name)
+        val outputCols = outputExprs.zip(outputColNames).map { case (expr, name) => Alias(expr, name)() }
+        val mergePlan = Project(outputCols, joinPlan)
+
+        val writePlan = buildWritePlan(mergePlan, target.table)
+
+        AppendData.byPosition(target, writePlan, Map.empty)
+
       case MergeIntoTable(target: DataSourceV2Relation, source, cond, matchedActions, notMatchedActions)
           if matchedActions.isEmpty && isIcebergRelation(target) =>
 
@@ -78,8 +96,8 @@ case class RewriteMergeInto(spark: SparkSession) extends Rule[LogicalPlan] with 
         val joinPlan = Join(source, targetTableScan, LeftAnti, Some(cond), JoinHint.NONE)
 
         val mergeParams = MergeIntoParams(
-          isSourceRowNotPresent = FALSE_LITERAL,
-          isTargetRowNotPresent = TRUE_LITERAL,
+          isSourceRowPresent = TRUE_LITERAL,
+          isTargetRowPresent = FALSE_LITERAL,
           matchedConditions = Nil,
           matchedOutputs = Nil,
           notMatchedConditions = notMatchedActions.map(getClauseCondition),
@@ -109,8 +127,8 @@ case class RewriteMergeInto(spark: SparkSession) extends Rule[LogicalPlan] with 
         val joinPlan = Join(newSourceTableScan, targetTableScan, RightOuter, Some(cond), JoinHint.NONE)
 
         val mergeParams = MergeIntoParams(
-          isSourceRowNotPresent = IsNull(findOutputAttr(joinPlan.output, ROW_FROM_SOURCE)),
-          isTargetRowNotPresent = FALSE_LITERAL,
+          isSourceRowPresent = IsNotNull(findOutputAttr(joinPlan.output, ROW_FROM_SOURCE)),
+          isTargetRowPresent = TRUE_LITERAL,
           matchedConditions = matchedConditions,
           matchedOutputs = matchedOutputs,
           notMatchedConditions = Nil,
@@ -141,8 +159,8 @@ case class RewriteMergeInto(spark: SparkSession) extends Rule[LogicalPlan] with 
         val joinPlan = Join(newSourceTableScan, newTargetTableScan, FullOuter, Some(cond), JoinHint.NONE)
 
         val mergeParams = MergeIntoParams(
-          isSourceRowNotPresent = IsNull(findOutputAttr(joinPlan.output, ROW_FROM_SOURCE)),
-          isTargetRowNotPresent = IsNull(findOutputAttr(joinPlan.output, ROW_FROM_TARGET)),
+          isSourceRowPresent = IsNotNull(findOutputAttr(joinPlan.output, ROW_FROM_SOURCE)),
+          isTargetRowPresent = IsNotNull(findOutputAttr(joinPlan.output, ROW_FROM_TARGET)),
           matchedConditions = matchedConditions,
           matchedOutputs = matchedOutputs,
           notMatchedConditions = notMatchedActions.map(getClauseCondition),
@@ -223,22 +241,6 @@ case class RewriteMergeInto(spark: SparkSession) extends Rule[LogicalPlan] with 
       }
     }
     !(actions.size == 1 && hasUnconditionalDelete(actions.headOption))
-  }
-
-  private def buildWritePlan(childPlan: LogicalPlan, table: Table): LogicalPlan = {
-    val icebergTable = Spark3Util.toIcebergTable(table)
-    val distribution = Spark3Util.buildRequiredDistribution(icebergTable)
-    val ordering = Spark3Util.buildRequiredOrdering(distribution, icebergTable)
-    // range partitioning in Spark triggers a skew estimation job prior to shuffling
-    // we insert a round-robin partitioning to avoid executing the merge join twice
-    val newChildPlan = distribution match {
-      case _: OrderedDistribution =>
-        val numShufflePartitions = conf.numShufflePartitions
-        Repartition(numShufflePartitions, shuffle = true, childPlan)
-      case _ =>
-        childPlan
-    }
-    DistributionAndOrderingUtils.prepareQuery(distribution, ordering, newChildPlan, conf)
   }
 }
 

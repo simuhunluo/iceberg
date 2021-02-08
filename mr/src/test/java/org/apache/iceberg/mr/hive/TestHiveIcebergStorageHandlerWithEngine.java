@@ -25,6 +25,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import org.apache.hadoop.hive.ql.exec.mr.ExecMapper;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -155,6 +156,11 @@ public class TestHiveIcebergStorageHandlerWithEngine {
     // HiveServer2 thread pools are using thread local Hive -> HMSClient objects. These are not cleaned up when the
     // HiveServer2 is stopped. Only Finalizer closes the HMS connections.
     System.gc();
+    // Mixing mr and tez jobs within the same JVM can cause problems. Mr jobs set the ExecMapper status to done=false
+    // at the beginning and to done=true at the end. However, tez jobs also rely on this value to see if they should
+    // proceed, but they do not reset it to done=false at the beginning. Therefore, without calling this after each test
+    // case, any tez job that follows a completed mr job will erroneously read done=true and will not proceed.
+    ExecMapper.setDone(false);
   }
 
   @Test
@@ -303,7 +309,7 @@ public class TestHiveIcebergStorageHandlerWithEngine {
 
     shell.executeStatement(query.toString());
 
-    HiveIcebergTestUtils.validateData(table, new ArrayList<>(HiveIcebergStorageHandlerTestUtils.CUSTOMER_RECORDS), 0);
+    HiveIcebergTestUtils.validateData(table, HiveIcebergStorageHandlerTestUtils.CUSTOMER_RECORDS, 0);
   }
 
   @Test
@@ -368,6 +374,25 @@ public class TestHiveIcebergStorageHandlerWithEngine {
     List<Record> records = new ArrayList<>(HiveIcebergStorageHandlerTestUtils.CUSTOMER_RECORDS);
     records.addAll(HiveIcebergStorageHandlerTestUtils.CUSTOMER_RECORDS);
     HiveIcebergTestUtils.validateData(table, records, 0);
+  }
+
+  @Test
+  public void testInsertFromSelectWithProjection() throws IOException {
+    Assume.assumeTrue("Tez write is not implemented yet", executionEngine.equals("mr"));
+
+    Table table = testTables.createTable(shell, "customers", HiveIcebergStorageHandlerTestUtils.CUSTOMER_SCHEMA,
+        fileFormat, ImmutableList.of());
+    testTables.createTable(shell, "orders", ORDER_SCHEMA, fileFormat, ORDER_RECORDS);
+
+    shell.executeStatement(
+        "INSERT INTO customers (customer_id, last_name) SELECT distinct(customer_id), 'test' FROM orders");
+
+    List<Record> expected = TestHelper.RecordsBuilder.newInstance(HiveIcebergStorageHandlerTestUtils.CUSTOMER_SCHEMA)
+        .add(0L, null, "test")
+        .add(1L, null, "test")
+        .build();
+
+    HiveIcebergTestUtils.validateData(table, expected, 0);
   }
 
   @Test
@@ -563,7 +588,7 @@ public class TestHiveIcebergStorageHandlerWithEngine {
     shell.executeStatement("CREATE TABLE default." + dummyTableName + "(a int)");
     shell.executeStatement("INSERT INTO TABLE default." + dummyTableName + " VALUES(1)");
     records.forEach(r -> shell.executeStatement(insertQueryForComplexType(tableName, dummyTableName, schema, r)));
-    HiveIcebergTestUtils.validateData(table, new ArrayList<>(records), 0);
+    HiveIcebergTestUtils.validateData(table, records, 0);
   }
 
   private String insertQueryForComplexType(String tableName, String dummyTableName, Schema schema, Record record) {

@@ -17,31 +17,29 @@
  * under the License.
  */
 
-package org.apache.iceberg.orc;
+package org.apache.iceberg.parquet;
 
 import java.io.IOException;
-import java.util.stream.Stream;
-import org.apache.iceberg.FieldMetrics;
-import org.apache.orc.storage.ql.exec.vector.VectorizedRowBatch;
+import java.util.List;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.TestMergingMetrics;
+import org.apache.iceberg.data.GenericAppenderFactory;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.io.FileAppender;
 
-/**
- * Write data value of a schema.
- */
-public interface OrcRowWriter<T> {
+public class TestGenericMergingMetrics extends TestMergingMetrics<Record> {
 
-  /**
-   * Writes or appends a row to ORC's VectorizedRowBatch.
-   *
-   * @param row    the row data value to write.
-   * @param output the VectorizedRowBatch to which the output will be written.
-   * @throws IOException if there's any IO error while writing the data value.
-   */
-  void write(T row, VectorizedRowBatch output) throws IOException;
+  public TestGenericMergingMetrics(FileFormat fileFormat) {
+    super(fileFormat);
+  }
 
-  /**
-   * Returns a stream of {@link FieldMetrics} that this OrcRowWriter keeps track of.
-   */
-  default Stream<FieldMetrics> metrics() {
-    return Stream.empty();
+  @Override
+  protected FileAppender<Record> writeAndGetAppender(List<Record> records) throws IOException {
+    FileAppender<Record> appender = new GenericAppenderFactory(SCHEMA).newAppender(
+        org.apache.iceberg.Files.localOutput(temp.newFile()), fileFormat);
+    try (FileAppender<Record> fileAppender = appender) {
+      records.forEach(fileAppender::add);
+    }
+    return appender;
   }
 }

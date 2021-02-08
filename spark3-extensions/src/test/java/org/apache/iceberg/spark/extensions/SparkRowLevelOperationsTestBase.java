@@ -25,10 +25,12 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.spark.SparkCatalog;
 import org.apache.iceberg.spark.SparkSessionCatalog;
 import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
@@ -129,6 +131,19 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkExtensionsTes
     }
   }
 
+  protected void append(String table, String jsonData) {
+    append(table, null, jsonData);
+  }
+
+  protected void append(String table, String schema, String jsonData) {
+    try {
+      Dataset<Row> ds = toDS(schema, jsonData);
+      ds.coalesce(1).writeTo(table).append();
+    } catch (NoSuchTableException e) {
+      throw new RuntimeException("Failed to write data", e);
+    }
+  }
+
   protected void createOrReplaceView(String name, String jsonData) {
     createOrReplaceView(name, null, jsonData);
   }
@@ -136,6 +151,10 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkExtensionsTes
   protected void createOrReplaceView(String name, String schema, String jsonData) {
     Dataset<Row> ds = toDS(schema, jsonData);
     ds.createOrReplaceTempView(name);
+  }
+
+  protected <T> void createOrReplaceView(String name, List<T> data, Encoder<T> encoder) {
+    spark.createDataset(data, encoder).createOrReplaceTempView(name);
   }
 
   private Dataset<Row> toDS(String schema, String jsonData) {
@@ -148,6 +167,28 @@ public abstract class SparkRowLevelOperationsTestBase extends SparkExtensionsTes
       return spark.read().schema(schema).json(jsonDS);
     } else {
       return spark.read().json(jsonDS);
+    }
+  }
+
+  protected void validateSnapshot(Snapshot snapshot, String operation, String changedPartitionCount,
+                                  String deletedDataFiles, String addedDataFiles) {
+    Assert.assertEquals("Operation must match", operation, snapshot.operation());
+    Assert.assertEquals("Changed partitions count must match",
+        changedPartitionCount,
+        snapshot.summary().get("changed-partition-count"));
+    Assert.assertEquals("Deleted data files count must match",
+        deletedDataFiles,
+        snapshot.summary().get("deleted-data-files"));
+    Assert.assertEquals("Added data files count must match",
+        addedDataFiles,
+        snapshot.summary().get("added-data-files"));
+  }
+
+  protected void sleep(long millis) {
+    try {
+      Thread.sleep(millis);
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
     }
   }
 }

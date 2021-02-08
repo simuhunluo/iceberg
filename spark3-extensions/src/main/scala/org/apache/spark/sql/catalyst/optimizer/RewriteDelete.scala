@@ -22,7 +22,6 @@ package org.apache.spark.sql.catalyst.optimizer
 import org.apache.iceberg.DistributionMode
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.expressions.Ascending
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.EqualNullSafe
@@ -49,13 +48,10 @@ import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Implici
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.BooleanType
 
-// TODO: should be part of early scan push down after the delete condition is optimized
 case class RewriteDelete(spark: SparkSession) extends Rule[LogicalPlan] with RewriteRowLevelOperationHelper {
 
   import ExtendedDataSourceV2Implicits._
   import RewriteRowLevelOperationHelper._
-
-  override def resolver: Resolver = spark.sessionState.conf.resolver
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
     // don't rewrite deletes that can be answered by passing filters to deleteWhere in SupportsDelete

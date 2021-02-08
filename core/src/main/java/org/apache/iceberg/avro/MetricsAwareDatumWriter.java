@@ -17,27 +17,19 @@
  * under the License.
  */
 
-package org.apache.iceberg;
+package org.apache.iceberg.avro;
 
-import java.io.IOException;
-import java.util.List;
-import org.apache.iceberg.data.GenericAppenderFactory;
-import org.apache.iceberg.data.Record;
-import org.apache.iceberg.io.FileAppender;
+import java.util.stream.Stream;
+import org.apache.avro.io.DatumWriter;
+import org.apache.iceberg.FieldMetrics;
 
-public class TestGenericMergingMetrics extends TestMergingMetrics<Record> {
+/**
+ * Wrapper writer around {@link DatumWriter} with metrics support.
+ */
+public interface MetricsAwareDatumWriter<D> extends DatumWriter<D> {
 
-  public TestGenericMergingMetrics(FileFormat fileFormat) {
-    super(fileFormat);
-  }
-
-  @Override
-  protected FileAppender<Record> writeAndGetAppender(List<Record> records) throws IOException {
-    FileAppender<Record> appender = new GenericAppenderFactory(SCHEMA).newAppender(
-        org.apache.iceberg.Files.localOutput(temp.newFile()), fileFormat);
-    try (FileAppender<Record> fileAppender = appender) {
-      records.forEach(fileAppender::add);
-    }
-    return appender;
-  }
+  /**
+   * Returns a stream of {@link FieldMetrics} that this MetricsAwareDatumWriter keeps track of.
+   */
+  Stream<FieldMetrics> metrics();
 }

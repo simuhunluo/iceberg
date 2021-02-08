@@ -17,18 +17,21 @@
  * under the License.
  */
 
-package org.apache.spark.sql.catalyst.plans.logical
+package org.apache.iceberg.spark.extensions;
 
-import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.util.truncatedString
-import org.apache.spark.sql.connector.iceberg.catalog.Procedure
-import scala.collection.Seq
+import java.util.Map;
+import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 
-case class Call(procedure: Procedure, args: Seq[Expression]) extends Command {
-  override lazy val output: Seq[Attribute] = procedure.outputType.toAttributes
+public class TestCopyOnWriteUpdate extends TestUpdate {
 
-  override def simpleString(maxFields: Int): String = {
-    s"Call${truncatedString(output, "[", ", ", "]", maxFields)} ${procedure.description}"
+  public TestCopyOnWriteUpdate(String catalogName, String implementation, Map<String, String> config,
+                               String fileFormat, boolean vectorized) {
+    super(catalogName, implementation, config, fileFormat, vectorized);
+  }
+
+  @Override
+  protected Map<String, String> extraTableProperties() {
+    return ImmutableMap.of(TableProperties.UPDATE_MODE, "copy-on-write");
   }
 }
